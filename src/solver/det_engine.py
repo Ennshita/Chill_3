@@ -21,6 +21,8 @@ from ..data.dataset import mscoco_category2label
 from ..misc import MetricLogger, SmoothedValue, dist_utils, save_samples
 from ..optim import ModelEMA, Warmup
 from .validator import Validator, scale_boxes
+import torch.nn.functional as F
+from datetime import datetime
 
 
 def train_one_epoch(
@@ -32,6 +34,8 @@ def train_one_epoch(
     epoch: int,
     use_wandb: bool,
     max_norm: float = 0,
+    teacher_model: torch.nn.Module = None,
+    cfg_solver = None,
     **kwargs,
 ):
     if use_wandb:
@@ -45,6 +49,23 @@ def train_one_epoch(
     epochs = kwargs.get("epochs", None)
     header = "Epoch: [{}]".format(epoch) if epochs is None else "Epoch: [{}/{}]".format(epoch, epochs)
 
+    use_distillation_active_for_epoch = False
+    distill_stop_epoch_val_for_epoch = epochs if epochs is not None else 1
+    
+    if cfg_solver is not None and hasattr(cfg_solver, 'yaml_cfg'):
+        _use_distill_from_cfg = cfg_solver.yaml_cfg.get('use_distillation', False)
+        if _use_distill_from_cfg and teacher_model is None:
+            if dist_utils.is_main_process():
+                print(f"[{datetime.now().isoformat()}] WARNING (train_one_epoch): Distillation is True in config, but teacher_model is None. Distillation will be SKIPPED.")
+            use_distillation_active_for_epoch = False
+        elif _use_distill_from_cfg and teacher_model is not None:
+            use_distillation_active_for_epoch = True
+            
+        _distill_stop_epoch_ratio = cfg_solver.yaml_cfg.get('distill_stop_epoch_ratio', 1.0)
+        if epochs is not None and epochs > 0:
+            distill_stop_epoch_val_for_epoch = int(epochs * _distill_stop_epoch_ratio)
+            
+            
     print_freq = kwargs.get("print_freq", 10)
     writer: SummaryWriter = kwargs.get("writer", None)
 
@@ -56,11 +77,51 @@ def train_one_epoch(
     output_dir = kwargs.get("output_dir", None)
     num_visualization_sample_batch = kwargs.get("num_visualization_sample_batch", 1)
 
+
+    if epoch == 0 and dist_utils.is_main_process(): # Chỉ in một lần ở epoch đầu, rank 0
+        if use_distillation_active_for_epoch and teacher_model is not None:
+            print(f"[{datetime.now().isoformat()}] INFO (train_one_epoch): Distillation is ACTIVE for this training run. Teacher model is present. Distillation will stop after epoch {distill_stop_epoch_val_for_epoch -1}.")
+        elif cfg_solver.yaml_cfg.get('use_distillation', False) and teacher_model is None:
+             print(f"[{datetime.now().isoformat()}] WARNING (train_one_epoch): 'use_distillation' is True in config, but teacher_model is None. Distillation WILL BE SKIPPED.")
+        else:
+            print(f"[{datetime.now().isoformat()}] INFO (train_one_epoch): Distillation is NOT active for this training run.")
+
     for i, (samples, targets) in enumerate(
         metric_logger.log_every(data_loader, print_freq, header)
     ):
+        
+        samples_on_device = samples.to(device) # Dòng này đúng cho student
+        targets_on_device = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
+        
         global_step = epoch * len(data_loader) + i
         metas = dict(epoch=epoch, step=i, global_step=global_step, epoch_step=len(data_loader))
+        
+        teacher_outputs_for_criterion = None # Sẽ dùng để truyền vào criterion sau này
+        if use_distillation_active_for_epoch and teacher_model is not None and epoch < distill_stop_epoch_val_for_epoch:
+            if i < 2 and dist_utils.is_main_process(): # Chỉ chạy test cho 2 batch đầu của mỗi epoch và ở rank 0
+                print(f"[{datetime.now().isoformat()}] DEBUG (train_one_epoch): Attempting teacher forward pass for epoch {epoch}, batch {i}...")
+            with torch.no_grad():
+                try:
+                    raw_teacher_outputs = teacher_model(samples_on_device)
+                    if isinstance(raw_teacher_outputs, dict) and 'pred_logits' in raw_teacher_outputs and 'pred_boxes' in raw_teacher_outputs:
+                        teacher_outputs_for_criterion = {
+                            'pred_logits': raw_teacher_outputs['pred_logits'].detach(),
+                            'pred_boxes': raw_teacher_outputs['pred_boxes'].detach()
+                            # Thêm các key khác nếu cần
+                        }
+                        if i < 2 and dist_utils.is_main_process():
+                            print(f"[{datetime.now().isoformat()}] DEBUG: Teacher output pred_logits shape: {teacher_outputs_for_criterion['pred_logits'].shape}")
+                            print(f"[{datetime.now().isoformat()}] DEBUG: Teacher output pred_boxes shape: {teacher_outputs_for_criterion['pred_boxes'].shape}")
+                            print(f"[{datetime.now().isoformat()}] DEBUG: Teacher forward pass successful for epoch {epoch}, batch {i}.")
+
+                    else:
+                        if i < 2 and dist_utils.is_main_process():
+                            print(f"[{datetime.now().isoformat()}] WARNING: Teacher output has unexpected structure. Type: {type(raw_teacher_outputs)}. Distillation for this batch might be skipped or fail.")
+                            if isinstance(raw_teacher_outputs, dict):
+                                print(f"Available keys in teacher output: {list(raw_teacher_outputs.keys())}")
+                except Exception as e_teacher_fwd:
+                    if i < 2 and dist_utils.is_main_process():
+                        print(f"[{datetime.now().isoformat()}] ERROR during teacher forward pass for epoch {epoch}, batch {i}: {e_teacher_fwd}")
 
         if global_step < num_visualization_sample_batch and output_dir is not None and dist_utils.is_main_process():
             save_samples(samples, targets, output_dir, "train", normalized=True, box_fmt="cxcywh")

@@ -6,7 +6,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 
-from ..core import BaseConfig
+from ..core import BaseConfig, YAMLConfig
 from ..misc import dist_utils
 
 
@@ -29,6 +29,7 @@ def remove_module_prefix(state_dict):
 class BaseSolver(object):
     def __init__(self, cfg: BaseConfig) -> None:
         self.cfg = cfg
+        print(f"[{datetime.now().isoformat()}] DEBUG: BaseSolver __init__ called. cfg type: {type(self.cfg)}")
         self.obj365_ids = [
             0,
             46,
@@ -111,7 +112,8 @@ class BaseSolver(object):
             328,
             226,
         ]
-
+        self.teacher_model = None
+        
     def _setup(self):
         """Avoid instantiating unnecessary classes"""
         cfg = self.cfg
@@ -120,7 +122,10 @@ class BaseSolver(object):
         else:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        self.device = device
         self.model = cfg.model
+        
+        print(f"[{datetime.now().isoformat()}] DEBUG: Initial self.model in _setup: {type(self.model)}") # Thêm dòng này
 
         # NOTE: Must load_tuning_state before EMA instance building
         if self.cfg.tuning:
@@ -132,7 +137,132 @@ class BaseSolver(object):
             sync_bn=cfg.sync_bn,
             find_unused_parameters=cfg.find_unused_parameters,
         )
+        
+        # Load teacher Model
+        if hasattr(cfg, 'yaml_cfg') and cfg.yaml_cfg.get('use_distillation', False):
+            print(f"[{datetime.now().isoformat()}] INFO: Distillation enabled. Setting up Teacher Model...")
+            
+            teacher_config_path_str = self.cfg.yaml_cfg.get('teacher_model_config_path')
+            teacher_weights_path_str = self.cfg.yaml_cfg.get('teacher_model_weights_path')
+            
+            if not teacher_config_path_str or not teacher_weights_path_str:
+                print(f"[{datetime.now().isoformat()}] WARNING: Distillation enabled, but 'teacher_model_config_path' or 'teacher_model_weights_path' is missing. Skipping teacher setup.")
+                self.teacher_model = None # Đảm bảo là None
+            else:
+                try:
+                    teacher_config_path = Path(teacher_config_path_str)
+                    teacher_weights_path = Path(teacher_weights_path_str)
 
+                    print(f"[{datetime.now().isoformat()}] DEBUG: Teacher config path: {teacher_config_path}")
+                    print(f"[{datetime.now().isoformat()}] DEBUG: Teacher weights path: {teacher_weights_path}")
+
+                    if not teacher_config_path.exists():
+                        raise FileNotFoundError(f"Teacher model config file not found: {teacher_config_path}")
+                    if not teacher_weights_path.exists():
+                        raise FileNotFoundError(f"Teacher model weights file not found: {teacher_weights_path}")
+
+                    # Bước 1: Tạo đối tượng YAMLConfig RIÊNG cho teacher model
+                    print(f"[{datetime.now().isoformat()}] INFO: Loading teacher config from: {teacher_config_path}")
+                    teacher_overrides = {
+                        'output_dir': Path(self.cfg.output_dir) / 'teacher_temp_setup',
+                        'device': str(self.device), 
+                        'resume': None, 'tuning': None, 'epochs': 1, 
+                        'seed': self.cfg.seed if hasattr(self.cfg, 'seed') else 0,
+                        'batch_size': self.cfg.batch_size if hasattr(self.cfg, 'batch_size') else 8, 
+                        'task': self.cfg.task if hasattr(self.cfg, 'task') else 'detection',
+                    }
+                    cfg_teacher_instance = YAMLConfig(str(teacher_config_path), **teacher_overrides)
+                    print(f"[{datetime.now().isoformat()}] DEBUG: cfg_teacher_instance created. Type: {type(cfg_teacher_instance)}")
+                    if not hasattr(cfg_teacher_instance, 'yaml_cfg'):
+                        print(f"[{datetime.now().isoformat()}] CRITICAL_ERROR: cfg_teacher_instance has no 'yaml_cfg' attribute!")
+                    elif 'model' not in cfg_teacher_instance.yaml_cfg:
+                        print(f"[{datetime.now().isoformat()}] CRITICAL_ERROR: 'model' key missing in cfg_teacher_instance.yaml_cfg. Keys: {list(cfg_teacher_instance.yaml_cfg.keys())}")
+                    else:
+                        print(f"[{datetime.now().isoformat()}] DEBUG: cfg_teacher_instance.yaml_cfg['model'] = {cfg_teacher_instance.yaml_cfg.get('model')}")
+
+
+                    # Bước 2: Sử dụng property .model của cfg_teacher_instance để tạo instance teacher model
+                    teacher_module_name_from_cfg = cfg_teacher_instance.yaml_cfg.get('model', 'UNKNOWN_TEACHER_MODULE')
+                    print(f"[{datetime.now().isoformat()}] INFO: Creating teacher model instance ('{teacher_module_name_from_cfg}')...")
+                    
+                    _temp_teacher_model = cfg_teacher_instance.model # Dòng này sẽ gọi create(...)
+                    
+                    print(f"[{datetime.now().isoformat()}] DEBUG: After attempting to create teacher model, _temp_teacher_model type: {type(_temp_teacher_model)}")
+                    if _temp_teacher_model is None:
+                        # Đây là một điểm lỗi tiềm năng quan trọng nếu create() trả về None mà không raise exception
+                        raise RuntimeError(f"Failed to create teacher model from config (create() returned None): {teacher_config_path}")
+                    if not isinstance(_temp_teacher_model, nn.Module):
+                         raise TypeError(f"Object created for teacher model is not an nn.Module. Got type: {type(_temp_teacher_model)}")
+                    print(f"[{datetime.now().isoformat()}] DEBUG: _temp_teacher_model created successfully. Type: {type(_temp_teacher_model)}")
+
+
+                    # Bước 3: Load weights cho teacher model
+                    print(f"[{datetime.now().isoformat()}] INFO: Loading teacher model weights from: {teacher_weights_path}")
+                    ckpt_teacher = torch.load(str(teacher_weights_path), map_location='cpu', weights_only=False) # Thêm weights_only=False để giữ nguyên hành vi cũ, nhưng xem xét cảnh báo
+                    
+                    teacher_state_dict = None
+                    if 'ema' in ckpt_teacher and ckpt_teacher['ema'] is not None and isinstance(ckpt_teacher['ema'], dict) and 'module' in ckpt_teacher['ema']:
+                        teacher_state_dict = ckpt_teacher['ema']['module']
+                        print(f"[{datetime.now().isoformat()}] INFO: Using EMA weights for teacher.")
+                    elif 'model' in ckpt_teacher and ckpt_teacher['model'] is not None:
+                        teacher_state_dict = ckpt_teacher['model']
+                        if isinstance(teacher_state_dict, dict) and 'module' in teacher_state_dict and len(teacher_state_dict) == 1: # Thường khi lưu model DDP
+                             teacher_state_dict = teacher_state_dict['module']                    
+                        print(f"[{datetime.now().isoformat()}] INFO: Using 'model' weights for teacher.")
+                    elif isinstance(ckpt_teacher, dict) and not ('ema' in ckpt_teacher or 'model' in ckpt_teacher): # ckpt là state_dict trực tiếp
+                        teacher_state_dict = ckpt_teacher
+                        print(f"[{datetime.now().isoformat()}] INFO: Using direct state_dict from checkpoint for teacher.")
+                    else:
+                        keys_found = list(ckpt_teacher.keys()) if isinstance(ckpt_teacher, dict) else 'Not a dict'
+                        raise ValueError(f"Could not find a valid state_dict in teacher checkpoint: {teacher_weights_path}. Keys available: {keys_found}")
+
+                    if teacher_state_dict is None:
+                        raise ValueError("teacher_state_dict is None after attempting to extract from checkpoint.")
+
+                    print(f"[{datetime.now().isoformat()}] DEBUG: Extracted teacher_state_dict. Number of keys: {len(teacher_state_dict)}")
+                    teacher_state_dict_cleaned = remove_module_prefix(teacher_state_dict)
+                    print(f"[{datetime.now().isoformat()}] DEBUG: Cleaned teacher_state_dict. Number of keys: {len(teacher_state_dict_cleaned)}")
+                    
+                    print(f"[{datetime.now().isoformat()}] DEBUG: Attempting to load state_dict into _temp_teacher_model...")
+                    missing_keys, unexpected_keys = _temp_teacher_model.load_state_dict(teacher_state_dict_cleaned, strict=True)
+                    if missing_keys:
+                        print(f"[{datetime.now().isoformat()}] WARNING: Missing keys when loading teacher weights: {missing_keys}")
+                    if unexpected_keys:
+                        print(f"[{datetime.now().isoformat()}] WARNING: Unexpected keys when loading teacher weights: {unexpected_keys}")
+                    print(f"[{datetime.now().isoformat()}] INFO: Teacher model weights loaded successfully into _temp_teacher_model.")
+                    
+                    # Bước 4: Gán, chuyển device, eval mode, đóng băng gradients
+                    self.teacher_model = _temp_teacher_model.to(self.device)
+                    self.teacher_model.eval()
+                    for param in self.teacher_model.parameters():
+                        param.requires_grad = False
+                    
+                    # Dòng print bạn hỏi
+                    print(f"[{datetime.now().isoformat()}] INFO: Teacher model setup SUCCEEDED. self.teacher_model type: {type(self.teacher_model)}, device: {next(self.teacher_model.parameters()).device if list(self.teacher_model.parameters()) else 'N/A'}")
+
+                except Exception as e:
+                    print(f"[{datetime.now().isoformat()}] ERROR: Failed to setup teacher model during try block: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    self.teacher_model = None 
+                    raise # Ném lại lỗi để dừng chương trình và xem xét
+            
+            # In ra trạng thái cuối cùng của self.teacher_model TRƯỚC KHI ra khỏi khối if cha
+            if dist_utils.is_main_process(): # dist_utils có thể chưa được init nếu lỗi xảy ra quá sớm
+                print(f"[{datetime.now().isoformat()}] DEBUG (_setup): End of 'use_distillation' block. self.teacher_model type: {type(self.teacher_model)}")
+        else: # Trường hợp use_distillation là False hoặc cfg không có yaml_cfg
+            if hasattr(cfg, 'yaml_cfg'):
+                print(f"[{datetime.now().isoformat()}] INFO: Distillation not enabled ('use_distillation' is {cfg.yaml_cfg.get('use_distillation', 'Not Set')}). Skipping teacher model setup.")
+            else:
+                print(f"[{datetime.now().isoformat()}] INFO: Distillation not enabled (cfg has no yaml_cfg). Skipping teacher model setup.")
+            self.teacher_model = None
+        # --- KẾT THÚC PHẦN KHỞI TẠO TEACHER MODEL ---
+
+        # In ra trạng thái self.teacher_model TRƯỚC KHI ra khỏi _setup
+        # Cần đảm bảo dist_utils đã được thiết lập nếu dùng ở đây
+        # if dist_utils.is_dist_available_and_initialized() and dist_utils.is_main_process():
+        print(f"[{datetime.now().isoformat()}] DEBUG (_setup): self.teacher_model type BEFORE _setup() exits: {type(self.teacher_model)}")
+                    
         self.criterion = self.to(cfg.criterion, device)
         self.postprocessor = self.to(cfg.postprocessor, device)
 

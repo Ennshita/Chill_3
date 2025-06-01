@@ -50,7 +50,9 @@ class DetSolver(BaseSolver):
                 self.evaluator,
                 self.device,
                 self.last_epoch,
-                self.use_wandb
+                self.use_wandb,
+                teacher_model=self.teacher_model,
+                cfg_solver=self.cfg  # <<< QUAN TRỌNG: Truyền self.cfg vào đây
             )
             for k in test_stats:
                 best_stat["epoch"] = self.last_epoch
@@ -89,6 +91,9 @@ class DetSolver(BaseSolver):
                 writer=self.writer,
                 use_wandb=self.use_wandb,
                 output_dir=self.output_dir,
+                
+                teacher_model=self.teacher_model,
+                cfg_solver=self.cfg  # <<< QUAN TRỌNG: Truyền self.cfg vào đây
             )
 
             if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():

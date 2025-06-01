@@ -3,6 +3,7 @@ Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+from datetime import datetime
 import copy
 import re
 
@@ -35,9 +36,36 @@ class YAMLConfig(BaseConfig):
 
     @property
     def model(self) -> torch.nn.Module:
+        # Thêm print ở đây để debug sâu hơn
+        print(f"[{datetime.now().isoformat()}] DEBUG: YAMLConfig.model property accessed.")
+        print(f"[{datetime.now().isoformat()}] DEBUG: YAMLConfig.model: self._model is type: {type(self._model)}")
+        print(f"[{datetime.now().isoformat()}] DEBUG: YAMLConfig.model: 'model' in self.yaml_cfg: {'model' in self.yaml_cfg}")
+        if 'model' in self.yaml_cfg:
+             print(f"[{datetime.now().isoformat()}] DEBUG: YAMLConfig.model: self.yaml_cfg['model'] value: {self.yaml_cfg['model']}")
+
         if self._model is None and "model" in self.yaml_cfg:
-            self._model = create(self.yaml_cfg["model"], self.global_cfg)
-        return super().model
+            model_name_to_create = self.yaml_cfg["model"]
+            print(f"[{datetime.now().isoformat()}] DEBUG: YAMLConfig.model: Attempting to create model: '{model_name_to_create}' using self.global_cfg")
+            # Để debug self.global_cfg, bạn có thể print một phần của nó, nhưng nó có thể rất lớn
+            # print(f"DEBUG: YAMLConfig.model: Relevant global_cfg for '{model_name_to_create}': {self.global_cfg.get(model_name_to_create)}")
+            try:
+                self._model = create(model_name_to_create, self.global_cfg) # Lỗi có thể xảy ra ở đây
+                print(f"[{datetime.now().isoformat()}] DEBUG: YAMLConfig.model: create() finished. self._model assigned type: {type(self._model)}")
+                if self._model is None:
+                     print(f"[{datetime.now().isoformat()}] CRITICAL_ERROR: YAMLConfig.model: create() returned None for '{model_name_to_create}'!")
+            except Exception as e:
+                print(f"[{datetime.now().isoformat()}] CRITICAL_ERROR: Exception during create('{model_name_to_create}') in YAMLConfig.model: {e}")
+                import traceback
+                traceback.print_exc()
+                # Bạn có thể quyết định raise lại lỗi ở đây để chương trình dừng ngay lập tức
+                # Hoặc để nó tiếp tục và self._model sẽ là None, gây ra lỗi sau này như bạn thấy
+                # raise # Bỏ comment dòng này để dừng ngay khi có lỗi trong create
+        
+        # Dòng super().model sẽ trả về self._model (thuộc tính của BaseConfig)
+        # Nếu self._model vẫn là None sau các bước trên, thì super().model sẽ trả về None
+        returned_model = super().model
+        print(f"[{datetime.now().isoformat()}] DEBUG: YAMLConfig.model: Returning model of type: {type(returned_model)}")
+        return returned_model
 
     @property
     def postprocessor(self) -> torch.nn.Module:

@@ -159,3 +159,68 @@ class ConvertPILImage(T.Transform):
         inpt = Image(inpt)
 
         return inpt
+
+
+@register()
+class RandomRotate90(T.Transform):
+    """Rotate the input by 90, 180, or 270 degrees, randomly chosen, with a given probability.
+
+    If the input is a :class:`~torchvision.tv_tensors.BoundingBoxes` tensor, CCE for Counter Clockwise):
+    - 90 degrees CCE: `(x_min, y_min, x_max, y_max)` -> `(H - y_max, x_min, H - y_min, x_max)`. New spatial_size: `(W, H)`.
+    - 180 degrees CCE: `(x_min, y_min, x_max, y_max)` -> `(W - x_max, H - y_max, W - x_min, H - y_min)`. New spatial_size: `(H, W)`.
+    - 270 degrees CCE: `(x_min, y_min, x_max, y_max)` -> `(y_min, W - x_max, y_max, W - x_min)`. New spatial_size: `(W, H)`.
+    The transformation of bounding boxes is handled by :func:`torchvision.transforms.v2.functional.rotate`.
+    """
+    _transformed_types = (
+        PIL.Image.Image,
+        Image,
+        Video,
+        Mask,
+        BoundingBoxes,
+    )
+
+    def __init__(self, p: float = 0.5) -> None:
+        super().__init__()
+        if not (0.0 <= p <= 1.0):
+            raise ValueError(f"probability p should be between 0 and 1, but got {p}")
+        self.p = p
+
+    def _get_params(self, flat_inputs: List[Any]) -> Dict[str, Any]:
+        # Randomly choose a number of 90-degree counter-clockwise rotations:
+        # k=1: 90 degrees
+        # k=2: 180 degrees
+        # k=3: 270 degrees
+        # F.rotate interprets positive angles as counter-clockwise.
+        k = torch.randint(1, 4, (1,)).item()
+        angle = float(k * 90)
+        return dict(angle=angle)
+
+    def _transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
+        angle = params["angle"]
+        # F.rotate handles PIL.Image, tv_tensors.Image, tv_tensors.Mask,
+        # tv_tensors.Video, and tv_tensors.BoundingBoxes.
+        # For 90, 180, 270 degree rotations, expand=False is typical.
+        # F.rotate correctly updates the spatial_size for tv_tensors like BoundingBoxes.
+        # e.g. if input image is HxW, after 90 deg rotation, its spatial_size becomes WxH.
+        return F.rotate(inpt, angle=angle, expand=False)
+
+    def forward(self, *inputs: Any) -> Any:
+        """
+        Args:
+            *inputs (Any): Inputs to be transformed. Can be a single image/video/mask/bbox
+                         or a tuple of these (e.g., image and target).
+
+        Returns:
+            Any: Transformed inputs or original inputs if the transform was not applied.
+        """
+        if torch.rand(1).item() < self.p:
+            # Apply the transform by calling the parent's forward method,
+            # which internally calls _get_params and _transform.
+            # super().forward() needs arguments to be passed individually,
+            # so *inputs unpacks the tuple.
+            return super().forward(*inputs)
+        else:
+            # Return inputs unchanged.
+            # If a single input was passed, e.g. transform(img), inputs = (img,). Return img.
+            # If multiple inputs, e.g. transform(img, target), inputs = (img, target). Return (img, target).
+            return inputs if len(inputs) > 1 else inputs[0]
