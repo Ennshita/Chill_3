@@ -69,11 +69,19 @@ DFINEPostProcessor:
 
 
 DFINECriterion:
-  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5}
+  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5, loss_distill: 0.1}
   losses: ['vfl', 'boxes', 'local']
   alpha: 0.75
   gamma: 2.0
   reg_max: 32
+  use_distillation: True # Sẽ được inject vào __init__ của DFINECriterion
+  distill_decay_type: 'linear_epoch'
+  distill_stop_epoch_ratio: 0.8
+  distill_cls_loss_factor: 1.0
+  distill_l1_loss_factor: 5.0
+  distill_iou_loss_factor: 2.0
+  distill_iou_ratio: 1.25
+  distill_power_transform_p: 2.0
 
   matcher:
     type: HungarianMatcher
