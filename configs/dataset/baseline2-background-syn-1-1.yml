@@ -11,8 +11,8 @@ train_dataloader:
   type: DataLoader
   dataset:
     type: CocoDetection
-    img_folder: /workspace/datasets/week2/baseline2-background-syn-1-1/train/images_resized
-    ann_file: /workspace/datasets/week2/baseline2-background-syn-1-1/train/train_resized.json
+    img_folder: /kaggle/input/fisheye8k/fisheye8K/train/images
+    ann_file: /kaggle/input/fisheye8k/fisheye8K/train/train.json
     return_masks: False
     transforms:
       type: Compose
@@ -27,8 +27,8 @@ val_dataloader:
   type: DataLoader
   dataset:
     type: CocoDetection
-    img_folder: /workspace/datasets/week2/baseline2-visdrone-syn-1-1/val/images_resized
-    ann_file: /workspace/datasets/week2/baseline2-visdrone-syn-1-1/val/val_resized.json
+    img_folder: /kaggle/input/fisheye8k/fisheye8K/val/images
+    ann_file: /kaggle/input/fisheye8k/fisheye8K/val/val.json
     return_masks: False
     transforms:
       type: Compose
