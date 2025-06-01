@@ -89,7 +89,7 @@ class DFINECriterion(nn.Module):
     # --- CÁC HÀM LOSS GỐC (loss_labels_focal, loss_labels_vfl, loss_boxes, loss_local) GIỮ NGUYÊN ---
     # Thêm **kwargs_ignored vào cuối danh sách tham số của các hàm loss gốc để chúng có thể nhận
     # các tham số thừa (như teacher_outputs, epoch, etc.) mà không báo lỗi khi được gọi từ get_loss.
-    def loss_labels_focal(self, outputs, targets, indices, num_boxes, **kwargs_ignored):
+    def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert "pred_logits" in outputs
         src_logits = outputs["pred_logits"]
         idx = self._get_src_permutation_idx(indices)
@@ -102,103 +102,156 @@ class DFINECriterion(nn.Module):
         loss = torchvision.ops.sigmoid_focal_loss(
             src_logits, target, self.alpha, self.gamma, reduction="none"
         )
-        # Chuẩn hóa: RT-DETR/DETR thường chia cho số lượng positive boxes (num_boxes).
-        # Nhân với src_logits.shape[1] (num_queries) có vẻ lạ, nhưng nếu D-FINE gốc làm vậy thì giữ lại.
-        # Tuy nhiên, để nhất quán, nên là: loss.sum() / num_boxes
-        loss = loss.sum() / (num_boxes * src_logits.shape[-1] + 1e-9) # Chia cho (số box * số class) hoặc chỉ num_boxes
-        # loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes # Cách của bạn
+        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
 
         return {"loss_focal": loss}
 
-    def loss_labels_vfl(self, outputs, targets, indices, num_boxes, values=None, **kwargs_ignored):
-        assert "pred_boxes" in outputs and "pred_logits" in outputs
+    def loss_labels_vfl(self, outputs, targets, indices, num_boxes, values=None):
+        assert "pred_boxes" in outputs
         idx = self._get_src_permutation_idx(indices)
-        if values is None: # values thường là iou được truyền từ get_loss_meta_info
-            src_boxes_matched = outputs["pred_boxes"][idx]
-            target_boxes_matched = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
-            if src_boxes_matched.numel() == 0: # Không có positive match nào
-                return {"loss_vfl": torch.tensor(0.0, device=outputs["pred_logits"].device)}
-            ious, _ = box_iou(box_cxcywh_to_xyxy(src_boxes_matched), box_cxcywh_to_xyxy(target_boxes_matched))
+        if values is None:
+            src_boxes = outputs["pred_boxes"][idx]
+            target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+            ious, _ = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
             ious = torch.diag(ious).detach()
         else:
             ious = values
 
-        src_logits = outputs["pred_logits"] # [bs, num_queries, num_classes]
+        src_logits = outputs["pred_logits"]
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        # Tạo target one-hot cho classification
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
+        target_classes = torch.full(
+            src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
+        )
         target_classes[idx] = target_classes_o
-        target_one_hot_cls = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :self.num_classes]
+        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
 
-        # Tạo target score cho VFL (IoU cho positive, 0 cho negative)
-        target_score_for_vfl = torch.zeros_like(src_logits) # [bs, num_queries, num_classes]
-        # Chỉ gán IoU cho đúng class của positive samples
-        # target_score_for_vfl[idx[0], idx[1], target_classes_o] = ious # Cách này sai shape nếu idx là tuple
-        # Cần tạo một tensor target_iou_scores [bs, num_queries] rồi expand
-        target_iou_scores = torch.zeros(src_logits.shape[:2], device=src_logits.device, dtype=src_logits.dtype)
-        target_iou_scores[idx] = ious.to(target_iou_scores.dtype) # Gán iou cho các vị trí positive
-        
-        # VFL target: target_one_hot_cls * target_iou_scores_expanded
-        target_score = target_one_hot_cls * target_iou_scores.unsqueeze(-1) # [bs, num_queries, num_classes]
+        target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
+        target_score_o[idx] = ious.to(target_score_o.dtype)
+        target_score = target_score_o.unsqueeze(-1) * target
 
-        pred_score_sigmoid = src_logits.sigmoid() # Không detach ở đây khi tính weight của VFL
-        weight = self.alpha * pred_score_sigmoid.pow(self.gamma) * (1 - target_score_for_vfl).abs() + target_score
-        # Hoặc weight của VFL gốc:
-        # pred_score_detached = pred_score_sigmoid.detach()
-        # weight = self.alpha * pred_score_detached.pow(self.gamma) * (1 - target_score) + target_score # Dùng target_score ở đây
+        pred_score = F.sigmoid(src_logits).detach()
+        weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
 
-        loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction="sum")
-        loss = loss / num_boxes 
+        loss = F.binary_cross_entropy_with_logits(
+            src_logits, target_score, weight=weight, reduction="none"
+        )
+        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
         return {"loss_vfl": loss}
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None, **kwargs_ignored):
+    def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None):
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+        targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+        The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
+        """
         assert "pred_boxes" in outputs
         idx = self._get_src_permutation_idx(indices)
-        if idx[0].numel() == 0: # Không có positive match
-             return {"loss_bbox": torch.tensor(0.0, device=outputs["pred_boxes"].device), 
-                     "loss_giou": torch.tensor(0.0, device=outputs["pred_boxes"].device)}
-
         src_boxes = outputs["pred_boxes"][idx]
         target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
-        
+        losses = {}
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction="none")
-        loss_bbox_sum = loss_bbox.sum() / (num_boxes + 1e-9) # num_boxes là số lượng positive samples
+        losses["loss_bbox"] = loss_bbox.sum() / num_boxes
 
-        loss_giou_values = 1 - torch.diag(
+        loss_giou = 1 - torch.diag(
             generalized_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
         )
-        if boxes_weight is not None: # boxes_weight là IoU từ get_loss_meta_info
-            loss_giou_values = loss_giou_values * boxes_weight
-        loss_giou_sum = loss_giou_values.sum() / (num_boxes + 1e-9)
+        loss_giou = loss_giou if boxes_weight is None else loss_giou * boxes_weight
+        losses["loss_giou"] = loss_giou.sum() / num_boxes
 
-        return {"loss_bbox": loss_bbox_sum, "loss_giou": loss_giou_sum}
-        
-    def loss_local(self, outputs, targets, indices, num_boxes, T=5, **kwargs_ignored):
-        # ... (GIỮ NGUYÊN CODE GỐC của loss_local) ...
-        # Nếu loss_local của bạn không hoạt động hoặc bạn muốn đơn giản hóa để test,
-        # bạn có thể tạm thời return loss 0 cho nó.
-        # Ví dụ:
-        # return {"loss_fgl": torch.tensor(0.0, device=self.device), "loss_ddf": torch.tensor(0.0, device=self.device)}
-        # SAU ĐÓ, COPY LẠI TOÀN BỘ CODE GỐC CỦA HÀM NÀY VÀO ĐÂY.
-        # Dưới đây là cấu trúc, bạn cần điền phần ...
-        current_losses = {}
+        return losses
+
+    def loss_local(self, outputs, targets, indices, num_boxes, T=5):
+        """Compute Fine-Grained Localization (FGL) Loss
+        and Decoupled Distillation Focal (DDF) Loss."""
+
+        losses = {}
         if "pred_corners" in outputs:
             idx = self._get_src_permutation_idx(indices)
-            if idx[0].numel() == 0: # Không có positive match
-                current_losses["loss_fgl"] = torch.tensor(0.0, device=outputs["pred_corners"].device)
-            else:
-                # ... (code tính FGL loss của bạn) ...
-                # current_losses["loss_fgl"] = ...
-                pass # Tạm thời
-            
-            if "teacher_corners" in outputs: # Logic DDF loss
-                if idx[0].numel() == 0:
-                     current_losses["loss_ddf"] = torch.tensor(0.0, device=outputs["pred_corners"].device)
+            target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+            pred_corners = outputs["pred_corners"][idx].reshape(-1, (self.reg_max + 1))
+            ref_points = outputs["ref_points"][idx].detach()
+            with torch.no_grad():
+                if self.fgl_targets_dn is None and "is_dn" in outputs:
+                    self.fgl_targets_dn = bbox2distance(
+                        ref_points,
+                        box_cxcywh_to_xyxy(target_boxes),
+                        self.reg_max,
+                        outputs["reg_scale"],
+                        outputs["up"],
+                    )
+                if self.fgl_targets is None and "is_dn" not in outputs:
+                    self.fgl_targets = bbox2distance(
+                        ref_points,
+                        box_cxcywh_to_xyxy(target_boxes),
+                        self.reg_max,
+                        outputs["reg_scale"],
+                        outputs["up"],
+                    )
+
+            target_corners, weight_right, weight_left = (
+                self.fgl_targets_dn if "is_dn" in outputs else self.fgl_targets
+            )
+
+            ious = torch.diag(
+                box_iou(
+                    box_cxcywh_to_xyxy(outputs["pred_boxes"][idx]), box_cxcywh_to_xyxy(target_boxes)
+                )[0]
+            )
+            weight_targets = ious.unsqueeze(-1).repeat(1, 1, 4).reshape(-1).detach()
+
+            losses["loss_fgl"] = self.unimodal_distribution_focal_loss(
+                pred_corners,
+                target_corners,
+                weight_right,
+                weight_left,
+                weight_targets,
+                avg_factor=num_boxes,
+            )
+
+            if "teacher_corners" in outputs:
+                pred_corners = outputs["pred_corners"].reshape(-1, (self.reg_max + 1))
+                target_corners = outputs["teacher_corners"].reshape(-1, (self.reg_max + 1))
+                if torch.equal(pred_corners, target_corners):
+                    losses["loss_ddf"] = pred_corners.sum() * 0
                 else:
-                    # ... (code tính DDF loss của bạn) ...
-                    # current_losses["loss_ddf"] = ...
-                    pass # Tạm thời
-        return current_losses
+                    weight_targets_local = outputs["teacher_logits"].sigmoid().max(dim=-1)[0]
+
+                    mask = torch.zeros_like(weight_targets_local, dtype=torch.bool)
+                    mask[idx] = True
+                    mask = mask.unsqueeze(-1).repeat(1, 1, 4).reshape(-1)
+
+                    weight_targets_local[idx] = ious.reshape_as(weight_targets_local[idx]).to(
+                        weight_targets_local.dtype
+                    )
+                    weight_targets_local = (
+                        weight_targets_local.unsqueeze(-1).repeat(1, 1, 4).reshape(-1).detach()
+                    )
+
+                    loss_match_local = (
+                        weight_targets_local
+                        * (T**2)
+                        * (
+                            nn.KLDivLoss(reduction="none")(
+                                F.log_softmax(pred_corners / T, dim=1),
+                                F.softmax(target_corners.detach() / T, dim=1),
+                            )
+                        ).sum(-1)
+                    )
+                    if "is_dn" not in outputs:
+                        batch_scale = (
+                            8 / outputs["pred_boxes"].shape[0]
+                        )  # Avoid the influence of batch size per GPU
+                        self.num_pos, self.num_neg = (
+                            (mask.sum() * batch_scale) ** 0.5,
+                            ((~mask).sum() * batch_scale) ** 0.5,
+                        )
+                    loss_match_local1 = loss_match_local[mask].mean() if mask.any() else 0
+                    loss_match_local2 = loss_match_local[~mask].mean() if (~mask).any() else 0
+                    losses["loss_ddf"] = (
+                        loss_match_local1 * self.num_pos + loss_match_local2 * self.num_neg
+                    ) / (self.num_pos + self.num_neg)
+
+        return losses
 
 
     # --- HÀM MỚI HOẶC ĐÃ SỬA ---
