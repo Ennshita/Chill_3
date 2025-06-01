@@ -332,6 +332,46 @@ class DFINECriterion(nn.Module):
         final_distill_loss = total_distill_loss_components * distill_decay
 
         return {"loss_distill": final_distill_loss}
+    
+    def _get_src_permutation_idx(self, indices):
+        # permute predictions following indices
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
+
+    def _get_tgt_permutation_idx(self, indices):
+        # permute targets following indices
+        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
+        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
+        return batch_idx, tgt_idx
+
+    def _get_go_indices(self, indices, indices_aux_list):
+        """Get a matching union set across all decoder layers."""
+        results = []
+        for indices_aux in indices_aux_list:
+            indices = [
+                (torch.cat([idx1[0], idx2[0]]), torch.cat([idx1[1], idx2[1]]))
+                for idx1, idx2 in zip(indices.copy(), indices_aux.copy())
+            ]
+
+        for ind in [torch.cat([idx[0][:, None], idx[1][:, None]], 1) for idx in indices]:
+            unique, counts = torch.unique(ind, return_counts=True, dim=0)
+            count_sort_indices = torch.argsort(counts, descending=True)
+            unique_sorted = unique[count_sort_indices]
+            column_to_row = {}
+            for idx in unique_sorted:
+                row_idx, col_idx = idx[0].item(), idx[1].item()
+                if row_idx not in column_to_row:
+                    column_to_row[row_idx] = col_idx
+            final_rows = torch.tensor(list(column_to_row.keys()), device=ind.device)
+            final_cols = torch.tensor(list(column_to_row.values()), device=ind.device)
+            results.append((final_rows.long(), final_cols.long()))
+        return results
+
+    def _clear_cache(self):
+        self.fgl_targets, self.fgl_targets_dn = None, None
+        self.own_targets, self.own_targets_dn = None, None
+        self.num_pos, self.num_neg = None, None
 
     # --- HÀM FORWARD ĐÃ ĐƯỢC SỬA ĐỔI ---
     def get_loss(self, loss_name, outputs, targets, indices, num_boxes, **kwargs):
@@ -375,7 +415,7 @@ class DFINECriterion(nn.Module):
                         torch.empty(0, dtype=torch.long, device=device_for_tensors)) 
                        for _ in range(len(targets))]
         
-        # self._clear_cache()
+        self._clear_cache()
 
         # --- Xử lý indices_go và num_boxes ---
         # Logic này cần phải rất cẩn thận. Dưới đây là một cách tiếp cận.
