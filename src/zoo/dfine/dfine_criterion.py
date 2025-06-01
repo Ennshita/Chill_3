@@ -136,7 +136,7 @@ class DFINECriterion(nn.Module):
         # target_score_for_vfl[idx[0], idx[1], target_classes_o] = ious # Cách này sai shape nếu idx là tuple
         # Cần tạo một tensor target_iou_scores [bs, num_queries] rồi expand
         target_iou_scores = torch.zeros(src_logits.shape[:2], device=src_logits.device, dtype=src_logits.dtype)
-        target_iou_scores[idx] = ious # Gán iou cho các vị trí positive
+        target_iou_scores[idx] = ious.to(target_iou_scores.dtype) # Gán iou cho các vị trí positive
         
         # VFL target: target_one_hot_cls * target_iou_scores_expanded
         target_score = target_one_hot_cls * target_iou_scores.unsqueeze(-1) # [bs, num_queries, num_classes]
