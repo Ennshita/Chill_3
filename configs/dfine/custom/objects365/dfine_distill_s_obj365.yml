@@ -10,9 +10,9 @@ output_dir: ./dfine_s_distill
 
 use_distillation: True
 
-teacher_model_config_path: /workspace/Repos/Enn/Chill_3/configs/dfine/custom/objects365/baseline2-background.yml
+teacher_model_config_path: configs/dfine/custom/objects365/baseline2-background.yml
 
-teacher_model_weights_path: /workspace/Repos/maibel/D-FINE/output/baseline2-background/checkpoint0074.pth
+teacher_model_weights_path: /kaggle/input/teacher/pytorch/default/1/last.pth
 
 
 DFINE:
