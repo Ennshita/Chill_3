@@ -375,7 +375,7 @@ class DFINECriterion(nn.Module):
                         torch.empty(0, dtype=torch.long, device=device_for_tensors)) 
                        for _ in range(len(targets))]
         
-        self._clear_cache()
+        # self._clear_cache()
 
         # --- Xử lý indices_go và num_boxes ---
         # Logic này cần phải rất cẩn thận. Dưới đây là một cách tiếp cận.
