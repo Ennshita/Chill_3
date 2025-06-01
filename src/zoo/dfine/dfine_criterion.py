@@ -89,7 +89,7 @@ class DFINECriterion(nn.Module):
     # --- CÁC HÀM LOSS GỐC (loss_labels_focal, loss_labels_vfl, loss_boxes, loss_local) GIỮ NGUYÊN ---
     # Thêm **kwargs_ignored vào cuối danh sách tham số của các hàm loss gốc để chúng có thể nhận
     # các tham số thừa (như teacher_outputs, epoch, etc.) mà không báo lỗi khi được gọi từ get_loss.
-    def loss_labels_focal(self, outputs, targets, indices, num_boxes):
+    def loss_labels_focal(self, outputs, targets, indices, num_boxes, meta=None, **kwargs_extra_just_in_case):
         assert "pred_logits" in outputs
         src_logits = outputs["pred_logits"]
         idx = self._get_src_permutation_idx(indices)
@@ -106,7 +106,7 @@ class DFINECriterion(nn.Module):
 
         return {"loss_focal": loss}
 
-    def loss_labels_vfl(self, outputs, targets, indices, num_boxes, values=None):
+    def loss_labels_vfl(self, outputs, targets, indices, num_boxes, values=None, meta=None):
         assert "pred_boxes" in outputs
         idx = self._get_src_permutation_idx(indices)
         if values is None:
@@ -138,7 +138,7 @@ class DFINECriterion(nn.Module):
         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
         return {"loss_vfl": loss}
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None):
+    def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None, meta=None, **kwargs_extra_just_in_case):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
         targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
         The target boxes are expected in format (center_x, center_y, w, h), normalized by the image size.
@@ -159,7 +159,7 @@ class DFINECriterion(nn.Module):
 
         return losses
 
-    def loss_local(self, outputs, targets, indices, num_boxes, T=5):
+    def loss_local(self, outputs, targets, indices, num_boxes, T=5, meta=None, **kwargs_extra_just_in_case):
         """Compute Fine-Grained Localization (FGL) Loss
         and Decoupled Distillation Focal (DDF) Loss."""
 
@@ -520,11 +520,22 @@ class DFINECriterion(nn.Module):
                     # hoặc dùng `num_boxes` (là `num_boxes_for_cls`) cho normalization.
                     loss_dict_component = self.get_loss(loss_name, outputs_without_aux_or_dn, targets, indices, num_boxes_for_cls, **call_kwargs)
                 else: 
-                    meta_info = self.get_loss_meta_info(loss_name, outputs_without_aux_or_dn, targets, current_indices)
-                    call_kwargs['meta'] = meta_info
-                    # Truyền runtime metas nếu loss gốc cần
-                    call_kwargs.update({k:v for k,v in kwargs_runtime_metas.items() if k not in ['teacher_outputs']})
-                    loss_dict_component = self.get_loss(loss_name, outputs_without_aux_or_dn, targets, current_indices, current_num_boxes, **call_kwargs)
+                    meta_info = self.get_loss_meta_info(loss_name, outputs, targets, current_indices)
+                    call_kwargs_for_get_loss = {'meta': meta_info} # Chỉ truyền meta
+                    # Truyền runtime metas nếu loss gốc CẦN (ví dụ T cho loss_local)
+                    if loss_name == 'local' and 'T' in kwargs_runtime_metas: # Ví dụ
+                        call_kwargs_for_get_loss['T'] = kwargs_runtime_metas['T']
+                    elif loss_name == 'local' and 'T' not in kwargs_runtime_metas: # Nếu T không có trong runtime_metas thì dùng giá trị mặc định của loss_local
+                        pass
+
+
+                    # Xóa các runtime metas không cần thiết cho loss gốc để tránh lỗi
+                    filtered_runtime_metas = {k:v for k,v in kwargs_runtime_metas.items() 
+                                              if k not in ['teacher_outputs', 'epoch', 'step', 'global_step', 'epoch_step', 'total_epochs'] or (loss_name=='local' and k=='T')}
+                    call_kwargs_for_get_loss.update(filtered_runtime_metas)
+
+
+                    loss_dict_component = self.get_loss(loss_name, outputs, targets, current_indices, current_num_boxes, **call_kwargs_for_get_loss)
                 
                 if loss_dict_component: # Kiểm tra None
                      weighted_loss_dict_component = {k: loss_dict_component[k] * self.weight_dict[k] for k in loss_dict_component if k in self.weight_dict}
